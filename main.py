@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
+import boto3
+from botocore.exceptions import ClientError
 
 
 app = FastAPI(title="LOOPED Backend")
@@ -23,6 +25,68 @@ app.add_middleware(
 
 class ExtractRequest(BaseModel):
     url: str
+
+
+def get_r2_client():
+    """Initialize S3-compatible Cloudflare R2 client."""
+    account_id = os.getenv("R2_ACCOUNT_ID")
+    access_key = os.getenv("R2_ACCESS_KEY_ID")
+    secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+    
+    if not all([account_id, access_key, secret_key]):
+        raise HTTPException(
+            status_code=500,
+            detail="R2 credentials not configured. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY."
+        )
+    
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+    )
+
+
+def upload_to_r2(file_path: Path, bucket_name: str, object_name: str) -> str:
+    """
+    Upload file to Cloudflare R2 and return the public URL.
+    
+    Args:
+        file_path: Path to the file to upload
+        bucket_name: R2 bucket name
+        object_name: Object key/name in R2
+    
+    Returns:
+        Public URL of the uploaded file
+    """
+    try:
+        s3_client = get_r2_client()
+        
+        with open(file_path, "rb") as f:
+            s3_client.upload_fileobj(
+                f,
+                bucket_name,
+                object_name,
+                ExtraArgs={"ContentType": "audio/mpeg"}
+            )
+        
+        # Construct public URL (assumes bucket has public access configured)
+        account_id = os.getenv("R2_ACCOUNT_ID")
+        public_url = f"https://{bucket_name}.{account_id}.r2.cloudflarestorage.com/{object_name}"
+        
+        return public_url
+    
+    except ClientError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"R2 upload failed: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upload error: {str(e)}"
+        )
 
 
 @app.get("/")
@@ -41,6 +105,8 @@ def extract(payload: ExtractRequest):
 
     raw_audio_path = temp_dir / "source.%(ext)s"
     mp3_path = temp_dir / "sound.mp3"
+    
+    audio_url = None
 
     try:
         ydl_opts = {
@@ -77,17 +143,31 @@ def extract(payload: ExtractRequest):
             stderr=subprocess.DEVNULL,
         )
 
+        # Upload to Cloudflare R2
+        bucket_name = os.getenv("R2_BUCKET_NAME")
+        if not bucket_name:
+            raise HTTPException(
+                status_code=500,
+                detail="R2_BUCKET_NAME not configured."
+            )
+        
+        # Generate unique filename: {job_id}.mp3
+        r2_object_name = f"{job_id}.mp3"
+        audio_url = upload_to_r2(mp3_path, bucket_name, r2_object_name)
+
         return {
             "title": info.get("title") or "TikTok Sound",
             "creator": info.get("uploader") or info.get("channel") or "Unknown creator",
             "duration": int(info.get("duration") or 0),
-            "audio_url": None,
+            "audio_url": audio_url,
             "thumbnail_url": info.get("thumbnail"),
             "source_url": payload.url,
             "tags": ["extracted", "tiktok", "looped"],
             "debug": {
                 "mp3_created": mp3_path.exists(),
-                "mp3_size_bytes": mp3_path.stat().st_size if mp3_path.exists() else 0
+                "mp3_size_bytes": mp3_path.stat().st_size if mp3_path.exists() else 0,
+                "r2_uploaded": audio_url is not None,
+                "r2_object_name": r2_object_name
             }
         }
 
@@ -95,4 +175,5 @@ def extract(payload: ExtractRequest):
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
     finally:
+        # Clean up temporary files
         shutil.rmtree(temp_dir, ignore_errors=True)
