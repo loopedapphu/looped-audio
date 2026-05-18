@@ -4,10 +4,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import boto3
+import yt_dlp
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import yt_dlp
 
 
 app = FastAPI(title="LOOPED Backend")
@@ -23,6 +25,54 @@ app.add_middleware(
 
 class ExtractRequest(BaseModel):
     url: str
+
+
+def get_r2_client():
+    account_id = os.getenv("R2_ACCOUNT_ID")
+    access_key = os.getenv("R2_ACCESS_KEY_ID")
+    secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
+
+    if not all([account_id, access_key, secret_key]):
+        raise HTTPException(
+            status_code=500,
+            detail="R2 credentials missing."
+        )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+    )
+
+
+def upload_to_r2(file_path: Path, object_key: str) -> str:
+    bucket_name = os.getenv("R2_BUCKET_NAME")
+    public_url = os.getenv("R2_PUBLIC_URL")
+
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="R2_BUCKET_NAME missing.")
+
+    if not public_url:
+        raise HTTPException(status_code=500, detail="R2_PUBLIC_URL missing.")
+
+    try:
+        client = get_r2_client()
+
+        client.upload_file(
+            str(file_path),
+            bucket_name,
+            object_key,
+            ExtraArgs={
+                "ContentType": "audio/mpeg"
+            },
+        )
+
+        return f"{public_url.rstrip('/')}/{object_key}"
+
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"R2 upload failed: {str(e)}")
 
 
 @app.get("/")
@@ -41,6 +91,7 @@ def extract(payload: ExtractRequest):
 
     raw_audio_path = temp_dir / "source.%(ext)s"
     mp3_path = temp_dir / "sound.mp3"
+    object_key = f"sounds/{job_id}.mp3"
 
     try:
         ydl_opts = {
@@ -54,6 +105,7 @@ def extract(payload: ExtractRequest):
             info = ydl.extract_info(payload.url, download=True)
 
         downloaded_files = list(temp_dir.glob("source.*"))
+
         if not downloaded_files:
             raise HTTPException(status_code=500, detail="Audio download failed.")
 
@@ -77,19 +129,27 @@ def extract(payload: ExtractRequest):
             stderr=subprocess.DEVNULL,
         )
 
+        audio_url = upload_to_r2(mp3_path, object_key)
+
         return {
             "title": info.get("title") or "TikTok Sound",
             "creator": info.get("uploader") or info.get("channel") or "Unknown creator",
             "duration": int(info.get("duration") or 0),
-            "audio_url": None,
+            "audio_url": audio_url,
+            "audio_key": object_key,
             "thumbnail_url": info.get("thumbnail"),
             "source_url": payload.url,
             "tags": ["extracted", "tiktok", "looped"],
             "debug": {
                 "mp3_created": mp3_path.exists(),
-                "mp3_size_bytes": mp3_path.stat().st_size if mp3_path.exists() else 0
-            }
+                "mp3_size_bytes": mp3_path.stat().st_size if mp3_path.exists() else 0,
+                "r2_uploaded": True,
+                "r2_object_key": object_key,
+            },
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
