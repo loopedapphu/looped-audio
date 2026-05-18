@@ -28,6 +28,7 @@ class ExtractRequest(BaseModel):
 
 
 def get_r2_client():
+    """Initialize S3-compatible Cloudflare R2 client."""
     account_id = os.getenv("R2_ACCOUNT_ID")
     access_key = os.getenv("R2_ACCESS_KEY_ID")
     secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
@@ -35,7 +36,7 @@ def get_r2_client():
     if not all([account_id, access_key, secret_key]):
         raise HTTPException(
             status_code=500,
-            detail="R2 credentials missing."
+            detail="R2 credentials missing: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY"
         )
 
     return boto3.client(
@@ -48,14 +49,15 @@ def get_r2_client():
 
 
 def upload_to_r2(file_path: Path, object_key: str) -> str:
+    """Upload file to R2 and return public URL."""
     bucket_name = os.getenv("R2_BUCKET_NAME")
-    public_url = os.getenv("R2_PUBLIC_URL")
+    account_id = os.getenv("R2_ACCOUNT_ID")
 
     if not bucket_name:
         raise HTTPException(status_code=500, detail="R2_BUCKET_NAME missing.")
 
-    if not public_url:
-        raise HTTPException(status_code=500, detail="R2_PUBLIC_URL missing.")
+    if not account_id:
+        raise HTTPException(status_code=500, detail="R2_ACCOUNT_ID missing.")
 
     try:
         client = get_r2_client()
@@ -64,12 +66,12 @@ def upload_to_r2(file_path: Path, object_key: str) -> str:
             str(file_path),
             bucket_name,
             object_key,
-            ExtraArgs={
-                "ContentType": "audio/mpeg"
-            },
+            ExtraArgs={"ContentType": "audio/mpeg"},
         )
 
-        return f"{public_url.rstrip('/')}/{object_key}"
+        # Auto-generate public URL from bucket name and account ID
+        public_url = f"https://{bucket_name}.{account_id}.r2.cloudflarestorage.com/{object_key}"
+        return public_url
 
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"R2 upload failed: {str(e)}")
